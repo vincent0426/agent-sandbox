@@ -367,5 +367,56 @@ class TestSandboxConnectorHeaderInjection(unittest.TestCase):
 
         connector.send_request("GET", "/execute")
 
+class TestSandboxConnectorErrorHandling(unittest.TestCase):
+    def _make_connector(self):
+        config = SandboxDirectConnectionConfig(api_url="http://router")
+        connector = SandboxConnector(
+            sandbox_id="sb",
+            namespace="ns",
+            connection_config=config,
+            k8s_helper=MagicMock(),
+        )
+        connector.strategy = DirectConnectionStrategy(config)
+        connector.session = MagicMock()
+        # Pretend a Pod IP was already resolved so a reset is detectable.
+        connector._pod_ip = "10.0.0.5"
+        connector._pod_ip_resolved = True
+        return connector
+
+    def _error_response(self, status_code):
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = status_code
+        resp.is_redirect = False
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+        return resp
+
+    def test_client_error_keeps_connection(self):
+        from k8s_agent_sandbox.connector import SandboxRequestError
+        connector = self._make_connector()
+        connector.session.request.return_value = self._error_response(404)
+
+        with self.assertRaises(SandboxRequestError) as ctx:
+            connector.send_request("GET", "download/missing.txt")
+
+        # A 404 means the sandbox answered: the connection must be left intact.
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(connector._pod_ip, "10.0.0.5")
+        self.assertTrue(connector._pod_ip_resolved)
+        connector.session.close.assert_not_called()
+
+    def test_transport_failure_resets_connection(self):
+        from k8s_agent_sandbox.connector import SandboxRequestError
+        connector = self._make_connector()
+        connector.session.request.side_effect = requests.exceptions.ConnectionError("refused")
+
+        with self.assertRaises(SandboxRequestError):
+            connector.send_request("GET", "download/x")
+
+        # A genuine transport failure should reset the Pod IP and close the tunnel.
+        self.assertIsNone(connector._pod_ip)
+        self.assertFalse(connector._pod_ip_resolved)
+        connector.session.close.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()
